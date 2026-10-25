@@ -244,6 +244,145 @@ class StateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.db.execute('SELECT digest FROM sent').fetchone()[0], 'original')
 
 
+class DestinationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / 'state.sqlite3'
+        self.store = Store(self.path)
+        self.store.configure_owner(123)
+        self.store.put('bot_username', 'example_bot')
+        self.bot = FakeBot()
+        self.kind = 'supergroup'
+        self.bot_status = 'administrator'
+        self.owner_status = 'creator'
+        self.can_post = True
+        async def call(method, **payload):
+            if method == 'getChat':
+                return {'id': -100123, 'type': self.kind}
+            if method == 'getMe':
+                return {'id': 7, 'username': 'example_bot'}
+            if method == 'getChatMember':
+                if payload['user_id'] == 7:
+                    return {'status': self.bot_status, 'can_post_messages': self.can_post}
+                return {'status': self.owner_status}
+            self.fail('Unexpected bot call: ' + method)
+        self.bot.call = AsyncMock(side_effect=call)
+
+    def tearDown(self):
+        self.store.db.close()
+        self.temp.cleanup()
+
+    async def command(self, text):
+        await process_registration(self.store, self.bot, update(text=text), SECRET)
+
+    async def test_group_routing_persists_without_changing_owner(self):
+        await self.command('/setgroup @example_group')
+        self.assertEqual(self.store.destination(), -100123)
+        self.assertEqual(self.store.owner(), 123)
+        self.assertIn('그룹 등록 완료', self.bot.sent[-1][1])
+        self.store.db.close()
+        self.store = Store(self.path)
+        self.store.initialize_channel(1, 10)
+        self.store.enqueue(1, 'codex_resets', message())
+        await deliver_one(self.store, self.bot)
+        self.assertEqual(self.bot.sent[-1][0], -100123)
+        self.assertEqual(self.store.owner(), 123)
+
+    async def test_channel_requires_post_permission(self):
+        self.kind = 'channel'
+        self.can_post = False
+        await self.command('/setchannel @example_channel')
+        self.assertEqual(self.store.destination(), 123)
+        self.assertIn('게시 권한', self.bot.sent[-1][1])
+        self.can_post = True
+        await self.command('/setchannel @example_channel')
+        self.assertEqual(self.store.destination(), -100123)
+        self.assertIn('채널 등록 완료', self.bot.sent[-1][1])
+
+    async def test_owner_and_bot_must_be_admins(self):
+        for bot_status, owner_status in [('member', 'creator'), ('administrator', 'member'),
+                                         ('administrator', 'left')]:
+            self.bot_status, self.owner_status = bot_status, owner_status
+            await self.command('/setgroup @example_group')
+            self.assertEqual(self.store.destination(), 123)
+            self.assertIn('관리자', self.bot.sent[-1][1])
+
+    async def test_other_users_and_group_messages_cannot_change_routing(self):
+        for command in ('/setgroup @example_group', '/setchannel @example_channel', '/setprivate'):
+            for request in (update(chat=456, text=command),
+                            update(chat=-100123, sender=123, kind='supergroup', text=command)):
+                await process_registration(self.store, self.bot, request, SECRET)
+        self.assertEqual(self.store.destination(), 123)
+        self.bot.call.assert_not_awaited()
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_registration_code_never_registers_a_group_owner(self):
+        self.store.db.execute("DELETE FROM settings WHERE key='owner_chat_id'")
+        await process_registration(self.store, self.bot,
+                                   update(chat=-100123, sender=123, kind='supergroup'), SECRET)
+        self.assertIsNone(self.store.owner())
+        self.assertIsNone(self.store.destination())
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_ping_in_configured_group_and_private_chat(self):
+        await self.command('/setgroup @example_group')
+        self.bot.sent.clear()
+        for request in (update(chat=-100123, sender=456, kind='supergroup', text='/ping@example_bot'),
+                        update(text='/ping')):
+            await process_registration(self.store, self.bot, request, SECRET)
+        self.assertEqual([chat for chat, _ in self.bot.sent], [-100123, 123])
+        await process_registration(self.store, self.bot,
+                                   update(chat=-100456, sender=456, kind='supergroup', text='/ping'), SECRET)
+        await process_registration(self.store, self.bot,
+                                   update(chat=-100123, sender=456, kind='supergroup', text='/ping@another_bot'), SECRET)
+        self.assertEqual(len(self.bot.sent), 2)
+
+    async def test_return_to_private_disables_old_group_ping(self):
+        await self.command('/setgroup @example_group')
+        await self.command('/setprivate')
+        self.assertEqual(self.store.destination(), 123)
+        count = len(self.bot.sent)
+        await process_registration(self.store, self.bot,
+                                   update(chat=-100123, sender=456, kind='supergroup', text='/ping'), SECRET)
+        self.assertEqual(len(self.bot.sent), count)
+
+    async def test_wrong_type_and_bad_target_preserve_previous_destination(self):
+        self.store.put('destination_chat_id', -100999)
+        for command in ('/setgroup', '/setgroup https://t.me/example_group', '/setgroup 123',
+                        '/setchannel @example_group'):
+            await self.command(command)
+            self.assertEqual(self.store.destination(), -100999)
+        self.kind = 'channel'
+        await self.command('/setgroup @example_channel')
+        self.assertEqual(self.store.destination(), -100999)
+
+    async def test_numeric_group_id_and_command_mention(self):
+        await self.command('/setgroup@example_bot -100123')
+        self.bot.call.assert_any_await('getChat', chat_id=-100123)
+        self.assertEqual(self.store.destination(), -100123)
+
+    async def test_permanent_api_error_is_replied_to_without_blocking_polling(self):
+        for code in (400, 403):
+            self.bot.call.side_effect = BotError(code)
+            await self.command('/setgroup @example_group')
+            self.assertEqual(self.store.destination(), 123)
+            self.assertIn('등록 실패', self.bot.sent[-1][1])
+        self.bot.call.side_effect = BotError(429)
+        with self.assertRaises(BotError):
+            await self.command('/setgroup @example_group')
+        self.assertEqual(self.store.destination(), 123)
+
+    async def test_failed_confirmation_can_be_retried_without_losing_owner(self):
+        self.bot.fail = True
+        with self.assertRaises(BotError):
+            await self.command('/setgroup @example_group')
+        self.assertEqual(self.store.destination(), -100123)
+        self.assertEqual(self.store.owner(), 123)
+        self.bot.fail = False
+        await self.command('/setgroup @example_group')
+        self.assertIn('그룹 등록 완료', self.bot.sent[-1][1])
+
+
 class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_api_errors_and_token_redaction(self):
         for code in [400, 401, 403, 409, 429, 500]:
@@ -311,6 +450,15 @@ class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.next_notice(), before)
         self.assertIsNone(self.store.get('bot_offset'))
         self.assertIn('모든 항목 정상', self.output[-1])
+
+    async def test_diagnosis_accepts_configured_channel(self):
+        self.store.put('destination_chat_id', -100123)
+        async def call(method, **payload):
+            return {'getMe': {'id': 7}, 'getWebhookInfo': {'url': ''},
+                    'getChat': {'id': -100123, 'type': 'channel'}}[method]
+        self.bot.call.side_effect = call
+        self.assertTrue(await self.check())
+        self.bot.call.assert_any_await('getChat', chat_id=-100123)
 
     async def test_unauthorized_user_still_checks_bot(self):
         self.client.is_user_authorized.return_value = False

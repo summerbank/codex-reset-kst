@@ -147,6 +147,10 @@ class Store:
         value = self.get("owner_chat_id")
         return int(value) if value else None
 
+    def destination(self):
+        value = self.get("destination_chat_id")
+        return int(value) if value else self.owner()
+
     def configure_owner(self, destination):
         if destination:
             if self.owner() and self.owner() != destination:
@@ -226,35 +230,85 @@ class Bot:
         return await self.call("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True)
 
 
+async def set_chat_destination(store, bot, target, channel=False):
+    # Resolve and authorize before changing durable notification routing.
+    command = "/setchannel" if channel else "/setgroup"
+    name = "채널" if channel else "그룹"
+    if not re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}|-[1-9][0-9]*", target):
+        return f"사용법: {command} @{name}사용자명 또는 {command} 음수ID (초대 링크는 지원하지 않음)"
+    try:
+        chat = await bot.call("getChat", chat_id=int(target) if target.startswith("-") else target)
+        allowed_types = ("channel",) if channel else ("group", "supergroup")
+        if chat.get("type") not in allowed_types or not isinstance(chat.get("id"), int) or chat["id"] >= 0:
+            return f"대상 유형이 다릅니다. 그룹은 /setgroup, 방송 채널은 /setchannel을 사용하세요."
+        identity = await bot.call("getMe")
+        bot_member = await bot.call("getChatMember", chat_id=chat["id"], user_id=identity["id"])
+        if bot_member.get("status") != "administrator":
+            return f"먼저 알림 봇을 대상 {name}에 초대하고 관리자로 지정하세요."
+        if channel and not bot_member.get("can_post_messages"):
+            return "채널에서 봇의 관리자 권한 중 메시지 게시 권한을 켜세요."
+        member = await bot.call("getChatMember", chat_id=chat["id"], user_id=store.owner())
+        if member.get("status") not in ("creator", "administrator"):
+            return f"등록된 소유자도 대상 {name}의 소유자 또는 관리자여야 합니다."
+    except BotError as exc:
+        if exc.code not in (400, 403):
+            raise
+        return f"{name} 등록 실패. 사용자명/ID, 봇 초대 여부와 관리자 권한을 확인하세요."
+    store.put("destination_chat_id", chat["id"])
+    LOG.info("Notification destination changed to %s", "channel" if channel else "group")
+    return f"{name} 등록 완료! 이후 Codex 초기화 알림을 등록한 {name}으로 보냅니다. 실행 확인은 이 개인 대화에서 /ping을 보내세요."
+
+
 async def process_registration(store, bot, update, secret):
     message = update.get("message", {})
     chat = message.get("chat", {})
     sender = message.get("from", {})
     chat_id = chat.get("id")
-    if chat.get("type") != "private" or chat_id != sender.get("id") or sender.get("is_bot"):
+    kind = chat.get("type")
+    if not sender.get("id") or sender.get("is_bot") or message.get("sender_chat"):
+        return
+    if kind == "private":
+        if chat_id != sender["id"]:
+            return
+    elif kind not in ("group", "supergroup") or not isinstance(chat_id, int) or chat_id >= 0:
         return
     parts = message.get("text", "").split(maxsplit=1)
     if not parts:
         return
-    command = parts[0].lower()
+    command, separator, mention = parts[0].lower().partition("@")
+    if separator and mention != (store.get("bot_username") or "").lower():
+        return
     owner = store.owner()
     if command in ("/ping", "/status"):
-        if owner == chat_id:
+        if (kind == "private" and owner == chat_id) or (kind in ("group", "supergroup") and store.destination() == chat_id):
             await bot.send(chat_id, "🏓 Pong! 모니터 프로세스가 실행 중입니다.\n응답 시각: "
                            + datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"))
+        return
+    # Ownership and routing changes are accepted only in the owner's private chat.
+    if kind != "private":
+        return
+    if command in ("/setgroup", "/setchannel", "/setprivate"):
+        if owner != chat_id:
+            return
+        if command == "/setprivate":
+            store.put("destination_chat_id", owner)
+            await bot.send(owner, "알림 대상을 소유자의 개인 채팅으로 변경했습니다.")
+        else:
+            target = parts[1].strip() if len(parts) > 1 else ""
+            await bot.send(owner, await set_chat_destination(store, bot, target, channel=command == "/setchannel"))
         return
     if command != "/start":
         return
     if owner:
         if owner == chat_id:
-            await bot.send(chat_id, "등록된 개인 채팅입니다. Codex 초기화 알림을 이곳으로 보냅니다.")
+            destination_name = "개인 채팅" if store.destination() == owner else "등록된 그룹/채널"
+            await bot.send(chat_id, f"등록된 소유자의 개인 채팅입니다. 현재 알림 대상: {destination_name}. 대상 변경: /setgroup @그룹사용자명 또는 /setchannel @채널사용자명")
         return
     supplied = parts[1] if len(parts) > 1 else ""
     if not secret or not hmac.compare_digest(supplied.encode(), secret.encode()):
-        # Do not expose whether a code was close/correct to an unregistered caller.
         return
     store.put("owner_chat_id", chat_id)
-    await bot.send(chat_id, "개인 채팅 등록 완료! Codex 초기화 알림을 이곳으로 보냅니다.")
+    await bot.send(chat_id, "개인 채팅 등록 완료! 기본 알림 대상은 이 개인 채팅입니다. 그룹 알림: /setgroup @그룹사용자명, 채널 알림: /setchannel @채널사용자명")
     LOG.info("Personal notification chat registered")
 
 
@@ -275,13 +329,13 @@ async def poll_registration(store, bot, secret):
 
 
 async def deliver_one(store, bot):
-    row = store.next_notice() if store.owner() else None
+    row = store.next_notice() if store.destination() else None
     if not row:
         return False
     channel_id, message_id, digest, notice = row
     store.sending = (channel_id, message_id)
     try:
-        await bot.send(store.owner(), notice)
+        await bot.send(store.destination(), notice)
         store.delivered(channel_id, message_id, digest)
     finally:
         store.sending = None
@@ -397,10 +451,12 @@ async def check_connections(config, store, client, bot, report=print):
     async def destination():
         if not store.owner():
             raise CheckFailure("개인 채팅 미등록. 모니터 실행 후 봇에 /start 등록코드 를 보내세요.")
-        chat = await bot.call("getChat", chat_id=store.owner())
-        if chat.get("type") != "private" or chat.get("id") != store.owner():
-            raise CheckFailure("등록된 대상이 올바른 개인 채팅이 아닙니다.")
-        return "등록된 개인 채팅 조회 성공 (실제 수신은 --test-notification으로 확인)"
+        chat = await bot.call("getChat", chat_id=store.destination())
+        if chat.get("id") != store.destination() or chat.get("type") not in ("private", "group", "supergroup", "channel"):
+            raise CheckFailure("등록된 대상이 올바른 개인 채팅, 그룹 또는 채널이 아닙니다.")
+        if chat["type"] == "private" and store.destination() != store.owner():
+            raise CheckFailure("개인 알림 대상이 등록된 소유자와 다릅니다.")
+        return "등록된 알림 대상 조회 성공 (실제 수신은 --test-notification으로 확인)"
 
     report("연결 진단: " + datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"))
     await step("저장소", database, "data/ 권한과 디스크 상태를 확인하세요.")
@@ -410,10 +466,10 @@ async def check_connections(config, store, client, bot, report=print):
         record("원본 채널", False, "사용자 세션 실패로 검사 생략")
     if await step("알림 봇", bot_identity, "BOT_TOKEN과 NAS의 HTTPS 연결을 확인하세요."):
         await step("봇 수신 설정", webhook, "봇의 webhook 설정과 네트워크를 확인하세요.")
-        await step("개인 채팅", destination, "봇의 개인 대화에서 /start 및 등록 상태를 확인하세요.")
+        await step("알림 대상", destination, "개인 등록 및 그룹/채널의 봇 관리자 권한을 확인하세요.")
     else:
         record("봇 수신 설정", False, "봇 인증 실패로 검사 생략")
-        record("개인 채팅", False, "봇 인증 실패로 검사 생략")
+        record("알림 대상", False, "봇 인증 실패로 검사 생략")
     ok = all(item[1] for item in results)
     report("진단 완료: " + ("모든 항목 정상" if ok else "실패 항목의 안내를 확인하세요."))
     return ok
@@ -462,6 +518,7 @@ async def run(config, store, authenticate=False):
                     if store.get("bot_id") and store.get("bot_id") != str(identity["id"]):
                         raise ValueError("봇이 변경됐습니다. 별도 DATA_DIR을 사용하세요 (README 참고).")
                     store.put("bot_id", identity["id"])
+                    store.put("bot_username", identity.get("username", ""))
                     if (await bot.call("getWebhookInfo")).get("url"):
                         raise ValueError("봇에 webhook이 설정돼 있습니다. 전용 BotFather 봇을 사용하세요.")
                     break
@@ -519,7 +576,7 @@ def main():
                         if not store.owner():
                             raise ValueError("먼저 봇에서 /start 등록코드 로 개인 채팅을 등록하세요.")
                         async with httpx.AsyncClient(timeout=40) as http:
-                            await Bot(http, config.token).send(store.owner(),
+                            await Bot(http, config.token).send(store.destination(),
                                 "Codex 초기화 테스트 알림\n한국시간: " + datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"))
                         LOG.info("Test notification sent")
                     else:
