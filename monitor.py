@@ -80,6 +80,12 @@ def render_notice(status, utc_time, source_link, edited=False):
     return "\n".join(lines)
 
 
+def render_test_notice():
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    return ("[테스트] " + render_notice("announced", now, None)
+            + "\n전송 확인용 메시지입니다. 원본 채널의 실제 초기화 공지가 아닙니다.")
+
+
 def message_link(username, chat_id, message_id):
     return f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{chat_id}/{message_id}"
 
@@ -286,6 +292,20 @@ async def process_registration(store, bot, update, secret):
         return
     # Ownership and routing changes are accepted only in the owner's private chat.
     if kind != "private":
+        return
+    if command == "/test":
+        if owner != chat_id:
+            return
+        destination = store.destination()
+        try:
+            await bot.send(destination, render_test_notice())
+        except BotError as exc:
+            if exc.fatal:
+                raise
+            await bot.send(owner, f"테스트 전송 실패 (code={exc.code}). 알림 대상의 봇 권한과 네트워크를 확인한 뒤 /test를 다시 보내세요.")
+        else:
+            if destination != owner:
+                await bot.send(owner, "설정된 알림 대상에 테스트 메시지를 전송했습니다. 해당 그룹/채널에서 수신을 확인하세요.")
         return
     if command in ("/setgroup", "/setchannel", "/setprivate"):
         if owner != chat_id:
@@ -576,8 +596,7 @@ def main():
                         if not store.owner():
                             raise ValueError("먼저 봇에서 /start 등록코드 로 개인 채팅을 등록하세요.")
                         async with httpx.AsyncClient(timeout=40) as http:
-                            await Bot(http, config.token).send(store.destination(),
-                                "Codex 초기화 테스트 알림\n한국시간: " + datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"))
+                            await Bot(http, config.token).send(store.destination(), render_test_notice())
                         LOG.info("Test notification sent")
                     else:
                         await run(config, store, args.login)

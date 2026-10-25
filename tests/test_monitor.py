@@ -275,6 +275,47 @@ class DestinationTests(unittest.IsolatedAsyncioTestCase):
     async def command(self, text):
         await process_registration(self.store, self.bot, update(text=text), SECRET)
 
+    async def test_remote_test_reaches_channel_without_changing_real_delivery_state(self):
+        self.kind = 'channel'
+        await self.command('/setchannel @example_channel')
+        self.store.initialize_channel(1, 10)
+        self.store.enqueue(1, 'codex_resets', message())
+        pending = self.store.next_notice()
+        self.bot.sent.clear()
+        await self.command('/test')
+        self.assertEqual([chat for chat, _ in self.bot.sent], [-100123, 123])
+        sample = self.bot.sent[0][1]
+        self.assertIn('[테스트]', sample)
+        self.assertIn('KST', sample)
+        self.assertIn('UTC', sample)
+        self.assertIn('실제 초기화 공지가 아닙니다', sample)
+        self.assertNotIn('https://t.me/', sample)
+        self.assertEqual(self.store.next_notice(), pending)
+        self.assertEqual(self.store.cursor(1), 10)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM sent').fetchone()[0], 0)
+
+    async def test_remote_test_only_accepts_owner_private_chat(self):
+        for request in (update(chat=456, text='/test'),
+                        update(chat=-100123, sender=123, kind='supergroup', text='/test')):
+            await process_registration(self.store, self.bot, request, SECRET)
+        self.assertEqual(self.bot.sent, [])
+        await self.command('/test')
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.sent[0][0], 123)
+
+    async def test_remote_test_permission_error_reports_to_owner(self):
+        self.store.put('destination_chat_id', -100123)
+        original_send = self.bot.send
+        async def reject_channel(chat, text):
+            if chat == -100123:
+                raise BotError(403)
+            await original_send(chat, text)
+        self.bot.send = reject_channel
+        await self.command('/test')
+        self.assertEqual(self.bot.sent[0][0], 123)
+        self.assertIn('테스트 전송 실패 (code=403)', self.bot.sent[0][1])
+        self.assertEqual(self.store.destination(), -100123)
+
     async def test_group_routing_persists_without_changing_owner(self):
         await self.command('/setgroup @example_group')
         self.assertEqual(self.store.destination(), -100123)
