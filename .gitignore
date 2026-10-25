@@ -1,7 +1,10 @@
 .env
-*.session
-*.session-journal
-sent.sqlite3
+.env.*
+!.env.sample
+*.session*
+*.sqlite3*
+*.db
+*.db-*
 __pycache__/
 .venv/
 data/

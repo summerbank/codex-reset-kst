@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+!.env.sample
+.venv
+__pycache__
+tests
+*.session*
+*.sqlite3*
+data
