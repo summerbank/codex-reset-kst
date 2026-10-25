@@ -323,6 +323,108 @@ async def watch_disconnect(client):
     raise RuntimeError("Telegram 사용자 연결이 종료됐습니다. 세션/네트워크와 로그를 확인하세요.")
 
 
+class CheckFailure(Exception):
+    """Only fixed, safe diagnostic messages may be placed in this exception."""
+
+
+async def check_connections(config, store, client, bot, report=print):
+    results = []
+
+    def record(label, ok, detail):
+        results.append((label, ok, detail))
+        report(f"[{'정상' if ok else '실패'}] {label}: {detail}")
+
+    async def step(label, operation, hint):
+        try:
+            detail = await asyncio.wait_for(operation(), timeout=20)
+        except CheckFailure as exc:
+            record(label, False, str(exc))
+        except BotError as exc:
+            record(label, False, f"Bot API code={exc.code}. {hint}")
+        except asyncio.TimeoutError:
+            record(label, False, f"20초 내 응답 없음. {hint}")
+        except Exception as exc:
+            # Exception text and request URLs may contain credentials.
+            record(label, False, f"{type(exc).__name__}. {hint}")
+        else:
+            record(label, True, detail)
+            return True
+        return False
+
+    async def database():
+        if store.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise CheckFailure("SQLite 무결성 확인 실패. data/ 백업을 확인하세요.")
+        count = store.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+        return f"SQLite 정상, 전송 대기 {count}건"
+
+    async def user_session():
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise CheckFailure("최초 인증 필요: docker compose run --rm monitor python monitor.py --login")
+        account = await client.get_me()
+        if not account or account.bot:
+            raise CheckFailure("사용자 계정 세션이 필요합니다. --login으로 사용자 계정을 인증하세요.")
+        return "사용자 계정 인증 및 Telegram 응답 확인"
+
+    async def channel():
+        entity = await client.get_entity(config.source)
+        if not getattr(entity, "broadcast", False):
+            raise CheckFailure("SOURCE_CHANNEL이 방송 채널이 아닙니다. @채널사용자명을 확인하세요.")
+        messages = await client.get_messages(entity, limit=1)
+        if getattr(entity, "left", False):
+            raise CheckFailure("채널 기록 접근 가능, 채널 미가입. 로그인한 사용자 계정으로 채널에 가입하세요.")
+        return "채널 가입 및 최신 기록 조회 확인" if messages else "채널 가입 및 기록 조회 확인 (게시물 없음)"
+
+    async def bot_identity():
+        identity = await bot.call("getMe")
+        if store.get("bot_id") and store.get("bot_id") != str(identity["id"]):
+            raise CheckFailure("저장된 봇과 BOT_TOKEN의 봇이 다릅니다. README의 봇 변경 절차를 확인하세요.")
+        return "봇 토큰 인증 및 HTTPS 응답 확인"
+
+    async def webhook():
+        if (await bot.call("getWebhookInfo")).get("url"):
+            raise CheckFailure("webhook이 설정되어 polling을 사용할 수 없습니다. 전용 봇을 사용하세요.")
+        return "webhook 없음 (다른 polling 프로세스의 존재는 검사하지 않음)"
+
+    async def destination():
+        if not store.owner():
+            raise CheckFailure("개인 채팅 미등록. 모니터 실행 후 봇에 /start 등록코드 를 보내세요.")
+        chat = await bot.call("getChat", chat_id=store.owner())
+        if chat.get("type") != "private" or chat.get("id") != store.owner():
+            raise CheckFailure("등록된 대상이 올바른 개인 채팅이 아닙니다.")
+        return "등록된 개인 채팅 조회 성공 (실제 수신은 --test-notification으로 확인)"
+
+    report("연결 진단: " + datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"))
+    await step("저장소", database, "data/ 권한과 디스크 상태를 확인하세요.")
+    if await step("사용자 세션", user_session, "NAS 네트워크와 사용자 인증 상태를 확인하세요."):
+        await step("원본 채널", channel, "SOURCE_CHANNEL 및 사용자 계정의 채널 접근 권한을 확인하세요.")
+    else:
+        record("원본 채널", False, "사용자 세션 실패로 검사 생략")
+    if await step("알림 봇", bot_identity, "BOT_TOKEN과 NAS의 HTTPS 연결을 확인하세요."):
+        await step("봇 수신 설정", webhook, "봇의 webhook 설정과 네트워크를 확인하세요.")
+        await step("개인 채팅", destination, "봇의 개인 대화에서 /start 및 등록 상태를 확인하세요.")
+    else:
+        record("봇 수신 설정", False, "봇 인증 실패로 검사 생략")
+        record("개인 채팅", False, "봇 인증 실패로 검사 생략")
+    ok = all(item[1] for item in results)
+    report("진단 완료: " + ("모든 항목 정상" if ok else "실패 항목의 안내를 확인하세요."))
+    return ok
+
+
+async def diagnose(config, store):
+    client = TelegramClient(str(config.data_dir / "telegram_user"), config.api_id, config.api_hash,
+                            connection_retries=0, request_retries=0, flood_sleep_threshold=0)
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            return await check_connections(config, store, client, Bot(http, config.token),
+                                           report=lambda text: print(text, flush=True))
+    finally:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5)
+        except Exception:
+            LOG.warning("Diagnostic session cleanup failed; process will exit")
+
+
 async def run(config, store, authenticate=False):
     client = TelegramClient(str(config.data_dir / "telegram_user"), config.api_id, config.api_hash,
                             auto_reconnect=True, connection_retries=5)
@@ -374,9 +476,11 @@ async def run(config, store, authenticate=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--login", action="store_true", help="Telegram 사용자 최초 인증만 실행")
-    parser.add_argument("--test-notification", action="store_true", help="등록된 채팅에 테스트 알림 전송")
-    parser.add_argument("--generate-registration-secret", action="store_true", help="랜덤 등록코드 생성")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="메시지 전송 없이 연결 상태 진단")
+    mode.add_argument("--login", action="store_true", help="Telegram 사용자 최초 인증만 실행")
+    mode.add_argument("--test-notification", action="store_true", help="등록된 채팅에 테스트 알림 전송")
+    mode.add_argument("--generate-registration-secret", action="store_true", help="랜덤 등록코드 생성")
     args = parser.parse_args()
     if args.generate_registration_secret:
         print(secrets.token_urlsafe(32))
@@ -400,7 +504,10 @@ def main():
                 async def entry():
                     task = asyncio.current_task()
                     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
-                    if args.test_notification:
+                    if args.check:
+                        if not await diagnose(config, store):
+                            raise SystemExit(1)
+                    elif args.test_notification:
                         if not store.owner():
                             raise ValueError("먼저 봇에서 /start 등록코드 로 개인 채팅을 등록하세요.")
                         async with httpx.AsyncClient(timeout=40) as http:

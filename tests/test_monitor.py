@@ -6,11 +6,11 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from monitor import (Bot, BotError, Config, Store, deliver_one, parse_reset,
+from monitor import (Bot, BotError, Config, Store, check_connections, deliver_one, parse_reset,
                      poll_registration, process_registration, reconcile, render_notice)
 
 UTC = timezone.utc
@@ -254,6 +254,82 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={'ok': True, 'result': {'message_id': 7}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             self.assertEqual((await Bot(http, 'dummy').send(123, 'notice'))['message_id'], 7)
+
+
+class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.store.configure_owner(123)
+        self.config = SimpleNamespace(source='@codex_resets')
+        self.client = SimpleNamespace(
+            connect=AsyncMock(), is_user_authorized=AsyncMock(return_value=True),
+            get_me=AsyncMock(return_value=SimpleNamespace(bot=False)),
+            get_entity=AsyncMock(return_value=SimpleNamespace(broadcast=True, left=False)),
+            get_messages=AsyncMock(return_value=[message()]))
+        self.calls = []
+        async def call(method, **payload):
+            self.calls.append(method)
+            return {'getMe': {'id': 7}, 'getWebhookInfo': {'url': ''},
+                    'getChat': {'id': 123, 'type': 'private'}}[method]
+        self.bot = SimpleNamespace(call=AsyncMock(side_effect=call))
+        self.output = []
+
+    def tearDown(self):
+        self.store.db.close()
+
+    async def check(self):
+        return await check_connections(self.config, self.store, self.client, self.bot, self.output.append)
+
+    async def test_success_does_not_send_consume_updates_or_change_tracking(self):
+        self.store.initialize_channel(1, 10)
+        self.store.enqueue(1, 'codex_resets', message())
+        before = self.store.next_notice()
+        self.assertTrue(await self.check())
+        self.assertEqual(self.calls, ['getMe', 'getWebhookInfo', 'getChat'])
+        self.assertEqual(self.store.cursor(1), 10)
+        self.assertEqual(self.store.next_notice(), before)
+        self.assertIsNone(self.store.get('bot_offset'))
+        self.assertIn('모든 항목 정상', self.output[-1])
+
+    async def test_unauthorized_user_still_checks_bot(self):
+        self.client.is_user_authorized.return_value = False
+        self.assertFalse(await self.check())
+        self.client.get_entity.assert_not_awaited()
+        self.assertIn('getChat', self.calls)
+        self.assertTrue(any('--login' in line for line in self.output))
+
+    async def test_bot_errors_are_redacted_and_channel_still_checked(self):
+        self.bot.call.side_effect = BotError(401)
+        self.assertFalse(await self.check())
+        self.client.get_messages.assert_awaited_once()
+        self.assertTrue(any('code=401' in line for line in self.output))
+        self.client.connect.side_effect = OSError('TOP_SECRET request URL')
+        self.assertFalse(await self.check())
+        self.assertNotIn('TOP_SECRET', '\n'.join(self.output))
+
+    async def test_webhook_and_unregistered_chat_fail_independently(self):
+        self.store.db.execute("DELETE FROM settings WHERE key='owner_chat_id'")
+        async def call(method, **payload):
+            return {'getMe': {'id': 7}, 'getWebhookInfo': {'url': 'https://TOP_SECRET'}}[method]
+        self.bot.call.side_effect = call
+        self.assertFalse(await self.check())
+        self.assertTrue(any('webhook이 설정' in line for line in self.output))
+        self.assertTrue(any('개인 채팅 미등록' in line for line in self.output))
+        self.assertNotIn('TOP_SECRET', '\n'.join(self.output))
+
+    async def test_wrong_bot_and_channel_membership(self):
+        self.store.put('bot_id', 99)
+        self.client.get_entity.return_value.left = True
+        self.assertFalse(await self.check())
+        self.assertTrue(any('채널 미가입' in line for line in self.output))
+        self.assertTrue(any('봇이 다릅니다' in line for line in self.output))
+        self.assertEqual(self.store.get('bot_id'), '99')
+
+    async def test_timeout_continues_with_independent_checks(self):
+        self.client.connect.side_effect = asyncio.TimeoutError
+        self.assertFalse(await self.check())
+        self.assertTrue(any('20초 내 응답 없음' in line for line in self.output))
+        self.assertIn('getChat', self.calls)
 
 
 class ConfigTests(unittest.TestCase):
