@@ -234,9 +234,17 @@ async def process_registration(store, bot, update, secret):
     if chat.get("type") != "private" or chat_id != sender.get("id") or sender.get("is_bot"):
         return
     parts = message.get("text", "").split(maxsplit=1)
-    if not parts or parts[0].lower() != "/start":
+    if not parts:
         return
+    command = parts[0].lower()
     owner = store.owner()
+    if command in ("/ping", "/status"):
+        if owner == chat_id:
+            await bot.send(chat_id, "🏓 Pong! 모니터 프로세스가 실행 중입니다.\n응답 시각: "
+                           + datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"))
+        return
+    if command != "/start":
+        return
     if owner:
         if owner == chat_id:
             await bot.send(chat_id, "등록된 개인 채팅입니다. Codex 초기화 알림을 이곳으로 보냅니다.")

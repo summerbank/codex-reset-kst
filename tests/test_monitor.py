@@ -101,6 +101,27 @@ class StateTests(unittest.IsolatedAsyncioTestCase):
         await process_registration(self.store, self.bot, update(text='/start'), SECRET)
         self.assertIn('등록된', self.bot.sent[-1][1])
 
+    async def test_owner_can_ping_running_monitor(self):
+        self.store.configure_owner(123)
+        for command in ('/ping', '/status'):
+            await process_registration(self.store, self.bot, update(text=command), SECRET)
+            self.assertEqual(self.bot.sent[-1][0], 123)
+            self.assertIn('Pong!', self.bot.sent[-1][1])
+            self.assertIn('모니터 프로세스가 실행 중', self.bot.sent[-1][1])
+            self.assertRegex(self.bot.sent[-1][1], r'응답 시각: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} KST')
+        self.assertEqual(self.store.owner(), 123)
+        self.assertIsNone(self.store.next_notice())
+
+    async def test_ping_ignores_unregistered_stranger_group_and_spoofed_sender(self):
+        await process_registration(self.store, self.bot, update(text='/ping'), SECRET)
+        self.assertEqual(self.bot.sent, [])
+        self.store.configure_owner(123)
+        for command in ('/ping', '/status'):
+            for request in (update(chat=456, text=command), update(text=command, kind='group'),
+                            update(text=command, sender=456)):
+                await process_registration(self.store, self.bot, request, SECRET)
+        self.assertEqual(self.bot.sent, [])
+
     async def test_poll_offset_is_saved_after_handling(self):
         class PollBot(FakeBot):
             async def call(bot_self, method, **payload):
