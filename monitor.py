@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, types, utils
 
 UTC = timezone.utc
 KST = ZoneInfo("Asia/Seoul")
@@ -80,6 +80,14 @@ def render_notice(status, utc_time, source_link, edited=False):
     return "\n".join(lines)
 
 
+def render_correction(source_link):
+    return ("⚠️ Codex 초기화 알림 정정\n상태: 원문 삭제\n"
+            "앞서 전달한 초기화 공지의 원문이 삭제되었습니다.\n"
+            "이전 알림을 현재 유효한 공지로 보지 마세요.\n"
+            "원문 삭제만으로 실제 초기화 여부를 판단할 수는 없습니다.\n"
+            "삭제된 원문: " + source_link)
+
+
 def render_test_notice():
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     return ("[테스트] " + render_notice("announced", now, None)
@@ -127,6 +135,7 @@ class Config:
 class Store:
     def __init__(self, path):
         self.sending = None
+        self.deletion_misses = {}
         self.db = sqlite3.connect(path)
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
@@ -139,7 +148,26 @@ class Store:
             CREATE TABLE IF NOT EXISTS outbox (
                 channel_id INTEGER, message_id INTEGER, digest TEXT NOT NULL, notice TEXT NOT NULL,
                 PRIMARY KEY(channel_id, message_id));
+            CREATE TABLE IF NOT EXISTS source_deleted (
+                channel_id INTEGER, message_id INTEGER, source_link TEXT NOT NULL,
+                PRIMARY KEY(channel_id, message_id));
+            CREATE TABLE IF NOT EXISTS deliveries (
+                channel_id INTEGER, message_id INTEGER, destination_id INTEGER,
+                corrected INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(channel_id, message_id, destination_id));
         """)
+        self.backfill_deliveries()
+
+    def backfill_deliveries(self):
+        # Older releases did not record destinations. Attribute each legacy receipt
+        # once to the configured destination; later routing changes must not copy it.
+        if self.destination():
+            with self.db:
+                self.db.execute("""INSERT INTO deliveries (channel_id, message_id, destination_id)
+                    SELECT s.channel_id, s.message_id, ? FROM sent s
+                    WHERE NOT EXISTS (SELECT 1 FROM deliveries d
+                        WHERE d.channel_id=s.channel_id AND d.message_id=s.message_id)""",
+                    (self.destination(),))
 
     def get(self, key):
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -162,6 +190,7 @@ class Store:
             if self.owner() and self.owner() != destination:
                 raise ValueError("BOT_CHAT_ID가 저장된 소유자와 다릅니다. README의 소유자 변경 절차를 확인하세요.")
             self.put("owner_chat_id", destination)
+            self.backfill_deliveries()
 
     def initialize_channel(self, channel_id, latest_id):
         with self.db:
@@ -176,6 +205,9 @@ class Store:
             self.db.execute("UPDATE watched SET cursor=MAX(cursor, ?) WHERE channel_id=?", (message_id, channel_id))
 
     def enqueue(self, channel_id, username, message, edited=False):
+        if self.db.execute("SELECT 1 FROM source_deleted WHERE channel_id=? AND message_id=?",
+                           (channel_id, message.id)).fetchone():
+            return  # Stale history/event snapshots cannot resurrect a deleted post.
         row = self.db.execute("SELECT floor FROM watched WHERE channel_id=?", (channel_id,)).fetchone()
         sent = self.db.execute("SELECT digest FROM sent WHERE channel_id=? AND message_id=?",
                                (channel_id, message.id)).fetchone()
@@ -198,10 +230,52 @@ class Store:
     def next_notice(self):
         return self.db.execute("SELECT channel_id, message_id, digest, notice FROM outbox ORDER BY channel_id, message_id LIMIT 1").fetchone()
 
-    def delivered(self, channel_id, message_id, digest):
+    def delivered(self, channel_id, message_id, digest, destination=None):
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sent VALUES (?, ?, ?)", (channel_id, message_id, digest))
+            if destination is not None:
+                self.db.execute("INSERT OR IGNORE INTO deliveries (channel_id, message_id, destination_id) VALUES (?, ?, ?)",
+                                (channel_id, message_id, destination))
             self.db.execute("DELETE FROM outbox WHERE channel_id=? AND message_id=? AND digest=?", (channel_id, message_id, digest))
+
+
+    def deletion_candidates(self, channel_id):
+        return [row[0] for row in self.db.execute("""
+            WITH tracked AS (
+                SELECT message_id FROM sent WHERE channel_id=?
+                UNION SELECT message_id FROM outbox WHERE channel_id=?)
+            SELECT message_id FROM tracked t WHERE NOT EXISTS (
+                SELECT 1 FROM source_deleted d WHERE d.channel_id=? AND d.message_id=t.message_id)
+            ORDER BY message_id DESC LIMIT 100""", (channel_id, channel_id, channel_id))]
+
+    def mark_deleted(self, channel_id, username, message_ids):
+        with self.db:
+            for message_id in message_ids:
+                tracked = self.db.execute("""SELECT 1 FROM sent WHERE channel_id=? AND message_id=?
+                    UNION SELECT 1 FROM outbox WHERE channel_id=? AND message_id=?""",
+                    (channel_id, message_id, channel_id, message_id)).fetchone()
+                if not tracked and self.sending != (channel_id, message_id):
+                    continue
+                self.db.execute("INSERT OR IGNORE INTO source_deleted VALUES (?, ?, ?)",
+                                (channel_id, message_id, message_link(username, channel_id, message_id)))
+                self.db.execute("DELETE FROM outbox WHERE channel_id=? AND message_id=?", (channel_id, message_id))
+                self.deletion_misses.pop((channel_id, message_id), None)
+
+    def next_correction(self):
+        return self.db.execute("""SELECT d.channel_id, d.message_id, d.destination_id, s.source_link
+            FROM deliveries d JOIN source_deleted s USING (channel_id, message_id)
+            WHERE d.corrected=0 AND d.retry_at<=? ORDER BY d.message_id, d.destination_id LIMIT 1""",
+            (datetime.now(UTC).timestamp(),)).fetchone()
+
+    def correction_delivered(self, channel_id, message_id, destination):
+        with self.db:
+            self.db.execute("UPDATE deliveries SET corrected=1 WHERE channel_id=? AND message_id=? AND destination_id=?",
+                            (channel_id, message_id, destination))
+
+    def defer_correction(self, channel_id, message_id, destination, seconds):
+        with self.db:
+            self.db.execute("UPDATE deliveries SET retry_at=? WHERE channel_id=? AND message_id=? AND destination_id=?",
+                            (datetime.now(UTC).timestamp() + max(60, seconds), channel_id, message_id, destination))
 
 
 class BotError(Exception):
@@ -349,14 +423,27 @@ async def poll_registration(store, bot, secret):
 
 
 async def deliver_one(store, bot):
+    correction = store.next_correction()
+    if correction:
+        channel_id, message_id, destination, link = correction
+        try:
+            await bot.send(destination, render_correction(link))
+        except BotError as exc:
+            # An inaccessible former destination must not block current notices.
+            store.defer_correction(channel_id, message_id, destination, exc.retry_after)
+            raise
+        store.correction_delivered(channel_id, message_id, destination)
+        LOG.info("Deletion correction sent for source message %s", message_id)
+        return True
     row = store.next_notice() if store.destination() else None
     if not row:
         return False
     channel_id, message_id, digest, notice = row
+    destination = store.destination()
     store.sending = (channel_id, message_id)
     try:
-        await bot.send(store.destination(), notice)
-        store.delivered(channel_id, message_id, digest)
+        await bot.send(destination, notice)
+        store.delivered(channel_id, message_id, digest, destination)
     finally:
         store.sending = None
     LOG.info("Notification sent for source message %s", message_id)
@@ -387,15 +474,51 @@ async def reconcile(client, store, entity):
     async for message in client.iter_messages(entity, limit=100):
         store.enqueue(channel_id, username, message, edited=bool(message.edit_date))
 
+    await reconcile_deletions(client, store, entity)
+
+
+def handle_deleted(store, entity, event):
+    # Updates with an unknown chat or a different channel must never retract ours.
+    expected_peer = utils.get_peer_id(types.PeerChannel(entity.id))
+    if event.chat_id == expected_peer:
+        store.mark_deleted(entity.id, getattr(entity, "username", None), event.deleted_ids)
+
+
+async def reconcile_deletions(client, store, entity):
+    ids = store.deletion_candidates(entity.id)
+    if not ids:
+        return
+    try:
+        messages = await client.get_messages(entity, ids=ids)
+    except Exception:
+        store.deletion_misses.clear()
+        raise
+    # Incomplete or mismatched results are inconclusive, never proof of deletion.
+    if len(messages) != len(ids) or any(m is not None and m.id != mid for mid, m in zip(ids, messages)):
+        store.deletion_misses.clear()
+        LOG.warning("Incomplete deletion check; no deletion inferred")
+        return
+    for mid, message in zip(ids, messages):
+        key = (entity.id, mid)
+        if message is not None:
+            store.deletion_misses.pop(key, None)
+            continue
+        count = store.deletion_misses.get(key, 0) + 1
+        store.deletion_misses[key] = count
+        if count >= 2:
+            store.mark_deleted(entity.id, getattr(entity, "username", None), [mid])
+
 
 async def scan_channel(client, store, entity):
     while True:
         try:
             await reconcile(client, store, entity)
         except errors.FloodWaitError as exc:
+            store.deletion_misses.clear()
             LOG.warning("Channel scan rate limited; waiting %s seconds", exc.seconds)
             await asyncio.sleep(exc.seconds)
         except (OSError, asyncio.TimeoutError, errors.ServerError):
+            store.deletion_misses.clear()
             LOG.warning("Channel scan failed; retrying in 60 seconds")
         await asyncio.sleep(60)
 
@@ -529,6 +652,9 @@ async def run(config, store, authenticate=False):
                           edited=bool(event.message.edit_date))
         client.add_event_handler(handle, events.NewMessage(chats=entity))
         client.add_event_handler(handle, events.MessageEdited(chats=entity))
+        async def on_delete(event):
+            handle_deleted(store, entity, event)
+        client.add_event_handler(on_delete, events.MessageDeleted(chats=entity))
         async with httpx.AsyncClient(timeout=40) as http:
             bot = Bot(http, config.token)
             # These calls fail fast on invalid credentials/webhook conflicts, retry transient errors.

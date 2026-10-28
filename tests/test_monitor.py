@@ -227,6 +227,8 @@ class StateTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_recovery_does_not_skip_messages_on_live_event(self):
         items = [message(mid=11), message(mid=12)]
         class Client:
+            async def get_messages(_, entity, ids):
+                return [message(mid=mid) for mid in ids]
             async def iter_messages(_, entity, **kwargs):
                 for item in items:
                     if 'min_id' not in kwargs or item.id > kwargs['min_id']:
